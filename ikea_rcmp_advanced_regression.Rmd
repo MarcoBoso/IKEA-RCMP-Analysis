@@ -1,0 +1,325 @@
+---
+title: "IKEA RCMP Omnichannel Analytics — Advanced Regression"
+author: "Marco Boso"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+---
+
+# Introduction
+
+The purpose of this project was to simulate and analyze key performance metrics for IKEA’s Remote Customer Meeting Point (RCMP) operations within an omnichannel retail environment. The dataset used in this analysis is entirely synthetic, created by collecting ideas and inspiration from various public sources, including the report Development of Key Performance Indicators for the Product Launch Process at IKEA Industry by Dennis Widmark and Rasmus Axenram (https://it.scribd.com/document/490444027/KPI-IKEA-pdf), as well as other publicly available materials on IKEA’s customer service processes. While the data does not represent real customer records, it was designed to reflect realistic patterns, variable distributions, and operational scenarios observed in the retail and customer service sector.
+
+The goal of this project was to identify the main drivers of Customer Satisfaction (CSAT) and First Contact Resolution (FCR), two critical KPIs for customer experience and operational efficiency. The analysis aimed to evaluate how different customer touchpoints, interaction types, operational metrics, and customer profiles influence these KPIs, and to explore predictive models that could support data-driven decision-making for continuous improvement across IKEA’s customer service channels.
+
+# Setup
+
+```{r}
+options(stringsAsFactors = FALSE)
+set.seed(123)
+```
+
+# Packages
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(MASS)
+library(glmnet)
+library(pROC)
+library(broom)
+library(ggplot2)
+library(forcats)
+library(data.table)
+```
+
+# Load data
+
+```{r}
+# Set your path here if needed:
+data_path <- "ikea_rcmp_simulated.csv"
+df <- read.csv(data_path)
+
+# Inspect
+cat("Rows:", nrow(df), "  Cols:", ncol(df), "\n")
+head(df)
+str(df)
+```
+
+This dataset contains 600 real-world style IKEA customer interactions, combining service, operational, and customer experience data. It captures when and where the interaction happened, the customer’s country and language, and how they contacted IKEA, both by general channel type such as in store, remote or digital, and hybrid, and by specific service channels. Key operational metrics include queue length, wait and handle times, backlog size, and service level agreement performance. Customer related details cover order value, product category, use of promotions, and whether the customer had contacted IKEA before. Contextual factors such as weekday, hour, and sentiment before the interaction help explain patterns in the two main KPIs which are First Contact Resolution and Customer Satisfaction. This mix of variables supports data driven analysis of performance drivers across IKEA’s omnichannel service model.
+
+# Basic cleaning and types
+
+```{r}
+df <- df %>%
+  mutate(
+    channel_type = factor(channel_type, levels = c("In-store","Remote/Digital","Hybrid")),
+    channel = as.factor(channel),
+    country = as.factor(country),
+    contact_reason = as.factor(contact_reason),
+    product_category = as.factor(product_category),
+    language = as.factor(language),
+    agent_id = as.factor(agent_id),
+    is_returning_customer = as.factor(is_returning_customer),
+    promo_used = as.factor(promo_used),
+    sla_breached = as.factor(sla_breached),
+    weekday = as.integer(weekday),  # 0-6
+    hour = as.integer(hour),
+    # Convenience transforms
+    wait_log = log1p(wait_time_sec),
+    handle_log = log1p(handle_time_min)
+  )
+
+# Numeric columns for quick correlation
+num_cols <- c("wait_time_sec","handle_time_min","queue_length","backlog_index",
+              "order_value","agent_tenure_months","pre_interaction_sentiment",
+              "weekday","hour","wait_log","handle_log","csat","fcr")
+nums <- df[, intersect(num_cols, names(df))]
+```
+
+# Train/Test split
+
+```{r}
+set.seed(42)
+in_train <- createDataPartition(df$csat, p = 0.75, list = FALSE)
+training <- df[in_train, ]
+testing  <- df[-in_train, ]
+
+cat("Train:", nrow(training), " Test:", nrow(testing), "\n")
+```
+
+# Quick EDA
+
+## CSAT distribution
+
+```{r fig.height=4}
+ggplot(training, aes(x = csat)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "CSAT distribution", x = "CSAT", y = "Count") +
+  theme_minimal()
+```
+
+The histogram shows that most customer satisfaction scores cluster around 3 and 4, with fewer perfect 5 ratings and very few low scores, indicating generally positive feedback but room to shift more interactions toward the highest satisfaction level.
+
+## CSAT vs Wait Time by Channel Type
+
+```{r fig.height=4}
+ggplot(training, aes(x = wait_time_sec, y = csat, color = channel_type)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "CSAT vs Wait Time by Channel Type") +
+  theme_minimal()
+```
+
+The plot shows that in-store channels experience a clear drop in satisfaction as wait times increase, remote/digital channels maintain fairly stable scores regardless of wait time, and hybrid channels display a slight positive trend, though with more variability.
+
+# Baselines
+
+```{r}
+# CSAT baseline: predict mean
+csat_mean <- mean(training$csat)
+pred_base_csat <- rep(csat_mean, nrow(testing))
+base_csat_metrics <- postResample(pred = pred_base_csat, obs = testing$csat)
+cat("\n[Baseline CSAT] RMSE:", base_csat_metrics["RMSE"], "  R2:", base_csat_metrics["Rsquared"], "\n")
+```
+
+The baseline CSAT model simply predicts the average satisfaction score from the training set for every case in the test set, without using any other information. This produces an RMSE of roughly 0.73, meaning the typical prediction is off by about three-quarters of a point on the CSAT scale. The R² is not defined because a constant model cannot explain any variance, serving only as a naive benchmark against which more sophisticated models can be compared.
+
+```{r}
+# FCR baseline: predict majority class
+fcr_majority <- as.integer(mean(as.integer(as.character(training$fcr))) >= 0.5)
+pred_base_fcr <- rep(fcr_majority, nrow(testing))
+base_acc <- mean(pred_base_fcr == as.integer(as.character(testing$fcr)))
+cat("[Baseline FCR] Accuracy:", round(base_acc,4), "\n")
+```
+
+The baseline FCR model predicts the majority outcome from the training set for all cases in the test set, ignoring any other predictors. This yields an accuracy of 0.75, meaning it correctly matches the actual FCR result three-quarters of the time, but like any majority-class predictor, it offers no insight into the factors influencing resolution and serves only as a simple benchmark for evaluating more advanced models.
+
+# Advanced Regression — CSAT (Linear)
+
+```{r}
+# Model with interactions and logs
+csat_formula <- csat ~ channel_type * wait_log +
+  channel + handle_log + queue_length + backlog_index + sla_breached +
+  country + is_returning_customer + order_value + promo_used +
+  weekday + hour + agent_tenure_months + pre_interaction_sentiment
+
+csat_lm <- lm(csat_formula, data = training)
+cat("\n[CSAT Linear Model]\n")
+summary(csat_lm)
+```
+
+This linear model explains about 16% of the variability in CSAT after adjusting for the number of predictors, indicating a modest fit. The most influential factors are pre-interaction sentiment, wait time, certain interaction channels, and the interaction between wait time and remote/digital channels. Specifically, higher pre-interaction sentiment strongly predicts higher CSAT, while longer waits tend to reduce satisfaction—particularly for in-store customers—although remote/digital interactions partly offset this effect. Most other variables, including order value, promotions, and country, show no significant relationship with CSAT in this sample, suggesting that service experience factors outweigh transactional or demographic attributes in driving satisfaction.
+
+```{r}
+# Predict & evaluate
+pred_csat_lm <- predict(csat_lm, newdata = testing)
+csat_lm_metrics <- postResample(pred = pred_csat_lm, obs = testing$csat)
+cat("[CSAT LM] RMSE:", csat_lm_metrics["RMSE"], " R2:", csat_lm_metrics["Rsquared"], "\n")
+```
+
+The CSAT linear model achieves an RMSE of about 0.68, meaning its predictions deviate from actual satisfaction scores by roughly two-thirds of a point on average. The R² of 0.17 shows it explains around 17% of the variance in CSAT, representing a modest improvement over the baseline but leaving most variability unexplained.
+
+# Stepwise AIC selection
+
+```{r}
+csat_step <- stepAIC(csat_lm, direction = "both", trace = FALSE)
+cat("\n[CSAT Stepwise AIC]\n")
+summary(csat_step)
+
+pred_csat_step <- predict(csat_step, newdata = testing)
+csat_step_metrics <- postResample(pred = pred_csat_step, obs = testing$csat)
+cat("[CSAT Stepwise] RMSE:", csat_step_metrics["RMSE"], " R2:", csat_step_metrics["Rsquared"], "\n")
+```
+
+The stepwise AIC-selected CSAT model retains only the most predictive variables, improving parsimony while slightly boosting performance. It explains about 17.8% of CSAT variance, with an RMSE of roughly 0.66, meaning predictions are on average two-thirds of a point off. Key drivers include pre-interaction sentiment, wait time, queue length, channel type, and the interaction between wait time and remote/digital channels, suggesting that how quickly and through which channel customers are served has a measurable impact on satisfaction.
+
+# Regularized (glmnet) for CSAT
+
+```{r message=FALSE, warning=FALSE}
+# Build model matrix (glmnet needs numeric matrix; use caret's dummyVars)
+dv <- dummyVars(~ channel_type + channel + sla_breached + country +
+                  is_returning_customer + promo_used + contact_reason + product_category + language,
+                data = training, fullRank = TRUE)
+
+X_train_cat <- predict(dv, newdata = training)
+X_test_cat  <- predict(dv, newdata = testing)
+
+# Combine categorical and numeric predictors
+X_train <- cbind(
+  X_train_cat,
+  dplyr::select(training, wait_time_sec, handle_time_min, queue_length, backlog_index, order_value,
+                agent_tenure_months, pre_interaction_sentiment, weekday, hour, wait_log, handle_log)
+) %>% as.matrix()
+
+X_test <- cbind(
+  X_test_cat,
+  dplyr::select(testing, wait_time_sec, handle_time_min, queue_length, backlog_index, order_value,
+                agent_tenure_months, pre_interaction_sentiment, weekday, hour, wait_log, handle_log)
+) %>% as.matrix()
+
+# Target
+y_train_csat <- training$csat
+
+# Train glmnet model
+set.seed(123)
+csat_glmnet <- cv.glmnet(X_train, y_train_csat, alpha = 0.5, family = "gaussian", nfolds = 5)
+cat("\n[CSAT glmnet] lambda.min:", csat_glmnet$lambda.min, "  lambda.1se:", csat_glmnet$lambda.1se, "\n")
+pred_csat_glmnet <- predict(csat_glmnet, s = "lambda.min", newx = X_test)
+csat_glmnet_metrics <- postResample(pred = as.numeric(pred_csat_glmnet), obs = testing$csat)
+cat("[CSAT glmnet] RMSE:", csat_glmnet_metrics["RMSE"], " R2:", csat_glmnet_metrics["Rsquared"], "\n")
+```
+
+The regularized glmnet model for CSAT, which blends Lasso and Ridge penalties (alpha = 0.5), identified its optimal complexity at a lambda of about 0.088, with a more conservative option at 0.106. Using the best lambda, the model achieved an RMSE of 0.65 and an R² of roughly 0.24, outperforming the earlier linear and stepwise models by explaining more variance in customer satisfaction while reducing prediction error. This suggests that regularization improved generalization by selecting relevant predictors and controlling overfitting.
+
+# Advanced Regression — FCR (Logistic)
+
+```{r}
+fcr_formula <- fcr ~ channel_type + channel + wait_log + handle_log +
+  queue_length + backlog_index + sla_breached + country +
+  is_returning_customer + order_value + promo_used +
+  weekday + hour + agent_tenure_months + pre_interaction_sentiment
+
+fcr_glm <- glm(fcr_formula, data = training, family = binomial())
+cat("\n[FCR Logistic Model]\n")
+summary(fcr_glm)
+```
+
+This logistic regression model for First Contact Resolution (FCR) suggests that, after controlling for multiple operational and contextual factors, only queue length and whether the customer is returning show statistically significant relationships with resolution likelihood. Longer queues are associated with a lower probability of resolving an issue on the first contact, while returning customers are more likely to achieve FCR. Most other variables, including wait time, backlog, channel type, country, and pre-interaction sentiment, do not reach statistical significance in this sample. The residual deviance (524.96 vs. 561.07 null deviance) and AIC of about 589 indicate the model achieves only modest improvement over the intercept-only baseline, suggesting that while it captures some useful signals, much of the variation in FCR remains unexplained.
+
+```{r}
+pred_fcr_prob <- predict(fcr_glm, newdata = testing, type = "response")
+pred_fcr_cls  <- ifelse(pred_fcr_prob > 0.5, 1, 0)
+acc_fcr_glm <- mean(pred_fcr_cls == testing$fcr)
+auc_fcr_glm <- pROC::auc(response = testing$fcr, predictor = pred_fcr_prob)
+cat("[FCR Logistic] Accuracy:", round(acc_fcr_glm,4), " AUC:", round(as.numeric(auc_fcr_glm),4), "\n")
+```
+
+The logistic FCR model correctly predicts about 69.6% of cases, but its AUC of 0.50 indicates no real discriminative ability beyond random guessing. This means the model’s accuracy is largely driven by class proportions in the data rather than its capacity to meaningfully distinguish between resolved and unresolved cases.
+
+# Regularized (glmnet) for FCR
+
+```{r message=FALSE, warning=FALSE}
+# Regularized (glmnet) for FCR
+y_train_fcr <- training$fcr
+set.seed(123)
+fcr_glmnet <- cv.glmnet(X_train, y_train_fcr, alpha = 0.5, family = "binomial", nfolds = 5)
+cat("\n[FCR glmnet] lambda.min:", fcr_glmnet$lambda.min, "  lambda.1se:", fcr_glmnet$lambda.1se, "\n")
+```
+
+The regularized glmnet model for FCR, using an elastic net penalty (alpha = 0.5), selected an optimal regularization strength at λ ≈ 0.088, with a more conservative one-standard-error choice at λ ≈ 0.141. This balance between Lasso and Ridge penalties aims to improve predictive performance by shrinking less relevant coefficients while retaining the most important predictors for distinguishing between resolved and unresolved first-contact cases.
+
+```{r}
+pred_fcr_prob_glmnet <- predict(fcr_glmnet, s = "lambda.min", newx = X_test, type = "response")
+pred_fcr_cls_glmnet  <- ifelse(pred_fcr_prob_glmnet > 0.5, 1, 0)
+acc_fcr_glmnet <- mean(pred_fcr_cls_glmnet == testing$fcr)
+auc_fcr_glmnet <- pROC::auc(response = testing$fcr, predictor = as.numeric(pred_fcr_prob_glmnet))
+cat("[FCR glmnet] Accuracy:", round(acc_fcr_glmnet,4), " AUC:", round(as.numeric(auc_fcr_glmnet),4), "\n")
+```
+
+The regularized glmnet model for FCR reaches an accuracy of 75%, matching the baseline majority-class predictor, but its AUC of 0.50 shows it has no meaningful ability to differentiate between resolved and unresolved cases. This suggests that, despite regularization, the model isn’t capturing predictive patterns beyond what could be achieved by always predicting the most frequent outcome.
+
+# Effect sizes and drivers
+
+```{r}
+cat("\n[Top drivers for CSAT (LM coefficients)]\n")
+tidy(csat_step) %>% arrange(desc(abs(estimate))) %>% head(20)
+```
+
+The stepwise CSAT model highlights pre-interaction sentiment as the strongest positive driver of satisfaction, with higher sentiment scores leading to notably better outcomes. Channel type also plays a role: remote/digital channels are associated with lower CSAT compared to the baseline, and hybrid channels show a large negative coefficient but with borderline significance, likely due to smaller sample size. Longer wait times reduce satisfaction overall, but the interaction between wait time and remote/digital channels partially offsets this drop, suggesting that customers using digital channels may tolerate delays better. Queue length shows a small but significant negative impact, while handle time has a weak positive, non-significant effect. These results indicate that customer mood before interaction and operational speed are key levers for improving satisfaction, alongside managing differences in channel expectations
+
+```{r}
+cat("\n[Non-zero coefficients for FCR (glmnet)]\n")
+coef_mat <- as.matrix(coef(fcr_glmnet, s = "lambda.min"))
+nz <- coef_mat[coef_mat[,1]!=0, , drop = FALSE]
+head(nz[order(abs(nz[,1]), decreasing = TRUE), , drop = FALSE], 25)
+```
+
+The regularized glmnet model for FCR identifies only two meaningful predictors at the optimal lambda: being a returning customer, which slightly increases the likelihood of resolving an issue on first contact, and queue length, which has a small negative effect. The intercept term suggests the baseline log-odds of FCR when predictors are at zero. The small magnitudes of these coefficients, combined with earlier performance metrics, reinforce that the model captures minimal predictive signal beyond these basic operational factors.
+
+# Visual checks
+
+```{r fig.height=4}
+# Observed vs Predicted CSAT
+pred_df <- data.frame(obs = testing$csat, pred = as.numeric(pred_csat_glmnet))
+ggplot(pred_df, aes(x = pred, y = obs)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  labs(title = "CSAT Observed vs Predicted (glmnet)", x = "Predicted", y = "Observed") +
+  theme_bw()
+```
+
+This plot compares the glmnet model’s predicted CSAT scores to the actual observed values. The points show some alignment with the 45-degree reference line, indicating the model captures part of the variation in satisfaction. However, the predictions are tightly clustered between roughly 3.3 and 4.2, suggesting limited spread and a tendency to underpredict extreme values, which explains the moderate R² observed earlier.
+
+```{r fig.height=4}
+# ROC curve for FCR
+roc_obj <- roc(response = testing$fcr, predictor = as.numeric(pred_fcr_prob_glmnet))
+plot(roc_obj, main = paste0("FCR ROC (AUC = ", round(as.numeric(auc_fcr_glmnet), 3), ")"))
+```
+
+This ROC curve assesses the glmnet model’s ability to classify First Contact Resolution (FCR). The AUC of 0.499 is essentially equivalent to random guessing, as reflected by the curve’s proximity to the diagonal reference line. This indicates that the model is not capturing meaningful predictive patterns for FCR in the current dataset.
+
+# Interpretation
+
+Overall, this IKEA-style omnichannel analytics project simulated a real RCMP KPI environment, using synthetic operational data to model and predict two key performance metrics: Customer Satisfaction (CSAT) and First Contact Resolution (FCR).
+For CSAT, several modeling approaches were tested — baseline averages, linear regression with stepwise selection, and regularized regression (glmnet). The best performance came from the regularized glmnet model, achieving an RMSE of about 0.65 and explaining roughly 24% of the variance. Key drivers of satisfaction included pre-interaction sentiment (positive effect), wait time (negative effect, with nuances by channel type), and certain channel–wait time interactions, showing the importance of managing both customer expectations and operational responsiveness across in-store, digital, and hybrid services.
+For FCR, logistic regression and glmnet were applied, but both performed poorly, with AUC values around 0.50 — essentially random classification. This suggests that the predictors available in the dataset do not capture the operational or behavioral drivers of FCR effectively
+Visual diagnostics confirmed the modest but non-random predictive power for CSAT, while FCR predictions lacked any meaningful signal. From an applied perspective, the project highlights that customer satisfaction in an omnichannel retail context can be partially predicted from operational and customer profile data, whereas FCR may require richer, more targeted features such as case complexity, agent skill match, or detailed interaction logs.
+
+# Save key outputs
+
+```{r}
+saveRDS(list(
+  csat_lm = csat_lm,
+  csat_step = csat_step,
+  csat_glmnet = csat_glmnet,
+  fcr_glm = fcr_glm,
+  fcr_glmnet = fcr_glmnet,
+  dv = dv
+), file = "ikea_models.rds")
+
+write.csv(pred_df, "ikea_csat_predictions.csv", row.names = FALSE)
+```
