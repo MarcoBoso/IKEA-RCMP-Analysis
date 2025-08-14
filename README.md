@@ -66,6 +66,7 @@ Includes:
 - CSAT vs Wait Time by channel type  
 - Observed vs Predicted CSAT scatter plot (glmnet)  
 - ROC curve for FCR
+- Dashboard that explores the evolution of CSAT and FCR in realtions with the variables 'date' and 'channel_type'
 
 ## How to Run
 
